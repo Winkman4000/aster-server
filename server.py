@@ -1,8 +1,10 @@
 """
 aster-server: runs deployed notebooks for aster-runner.
 
-Two ways to use it: as a GitHub Actions job (run.py, started by the runner through the
-GitHub API; .github/workflows/run.yml), or as a long-running HTTP server (below).
+Ways to run it:
+  python server.py --poll   always-on, asking the runner for queued runs (the default setup)
+  python server.py          an HTTP server the runner calls (SERVER_URL)
+  python run.py             one run, as a GitHub Actions job (.github/workflows/run.yml)
 
 The runner (Cloudflare Worker) keeps the schedules; when a notebook is due, or someone
 asks for a run, it calls POST /run here. This server reads the notebook from the runner,
@@ -168,7 +170,43 @@ class Handler(BaseHTTPRequestHandler):
         print(time.strftime("%H:%M:%S"), fmt % args, flush=True)
 
 
+POLL_SECONDS = 10
+
+
+def poll():
+    """Asks the runner for queued runs every few seconds and starts them. Needs no open
+    port: every connection goes out from here."""
+    import socket
+    host = socket.gethostname()
+    last_beat = 0
+    while True:
+        try:
+            beat = time.time() - last_beat >= 60
+            with _lock:
+                running = sorted(_running)
+            jobs = runner("POST", "/api/svc/claim",
+                          {"heartbeat": beat, "host": host, "running": running})["jobs"]
+            if beat:
+                last_beat = time.time()
+            for job in jobs:
+                workflow = job["workflow"]
+                with _lock:
+                    if workflow in _running:
+                        print(f"{workflow} is already running; skipped", flush=True)
+                        continue
+                    _running.add(workflow)
+                print(time.strftime("%H:%M:%S"), "run", workflow, job.get("trigger", ""), flush=True)
+                threading.Thread(target=run_notebook, daemon=True,
+                                 args=(workflow, job.get("trigger", "manual"), job.get("slot", ""))).start()
+        except Exception as err:  # noqa: BLE001 - keep polling through outages
+            print(time.strftime("%H:%M:%S"), "poll:", err, flush=True)
+        time.sleep(POLL_SECONDS)
+
+
 if __name__ == "__main__":
     if not RUNNER_URL or not TOKEN:
-        print("ASTER_RUNNER_URL and ASTER_RUNNER_TOKEN must be set", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "7860"))), Handler).serve_forever()
+        sys.exit("ASTER_RUNNER_URL and ASTER_RUNNER_TOKEN must be set")
+    if "--poll" in sys.argv:
+        poll()
+    else:
+        ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "7860"))), Handler).serve_forever()

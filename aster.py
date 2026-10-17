@@ -207,13 +207,15 @@ def local_time(iso=None, tz="America/New_York"):
     """`iso` (default: now) as a datetime in `tz`. Falls back to this machine's own
     timezone where Python has no timezone data (Windows without the tzdata package)."""
     when = _datetime.fromisoformat(iso) if iso else _datetime.now(_timezone.utc)
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=_timezone.utc)
     try:
         from zoneinfo import ZoneInfo
-        return when.astimezone(ZoneInfo(tz))
+        zone = ZoneInfo(tz)
     except Exception:  # noqa: BLE001
-        return when.astimezone()
+        zone = None
+    if when.tzinfo is None:
+        # A scheduled slot ("2026-10-17T07:00") is already local time in the schedule's zone.
+        return when.replace(tzinfo=zone) if zone else when.astimezone()
+    return when.astimezone(zone) if zone else when.astimezone()
 
 
 def _get(url, headers, timeout):
