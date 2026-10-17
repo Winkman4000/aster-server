@@ -1,0 +1,34 @@
+# Runs one Aster notebook. aster-runner starts this through the GitHub API when a
+# notebook is due or someone asks for a run; results go back to the runner.
+name: run
+run-name: ${{ inputs.workflow }} (${{ inputs.trigger }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      workflow: { description: Notebook id, required: true }
+      trigger: { description: What started it, default: manual }
+      slot: { description: Scheduled slot, default: "" }
+
+# One run of a notebook at a time; a second one waits for the first.
+concurrency:
+  group: ${{ inputs.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the notebook
+        run: python3 run.py
+        env:
+          ASTER_RUNNER_URL: ${{ secrets.ASTER_RUNNER_URL }}
+          ASTER_RUNNER_TOKEN: ${{ secrets.ASTER_RUNNER_TOKEN }}
+          WORKFLOW: ${{ inputs.workflow }}
+          TRIGGER: ${{ inputs.trigger }}
+          SLOT: ${{ inputs.slot }}
