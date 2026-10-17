@@ -178,6 +178,82 @@ class Handler(BaseHTTPRequestHandler):
 
 
 POLL_SECONDS = 10
+STORAGE_EVERY = 600           # seconds between Cloud Storage size checks
+
+METADATA = "http://metadata.google.internal/computeMetadata/v1/"
+
+
+def metadata(path):
+    """A value from the Google Cloud metadata server ("" when not on Google Cloud)."""
+    try:
+        request = urllib.request.Request(METADATA + path, headers={"Metadata-Flavor": "Google"})
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.read().decode()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def machine():
+    """What this machine is: provider, type, zone, CPUs (sent with every heartbeat)."""
+    zone = metadata("instance/zone").rsplit("/", 1)[-1]
+    kind = metadata("instance/machine-type").rsplit("/", 1)[-1]
+    return {
+        "provider": "Google Cloud" if zone else "",
+        "machineType": kind, "zone": zone, "project": metadata("project/project-id"),
+        "cpus": os.cpu_count() or 0, "python": sys.version.split()[0],
+    }
+
+
+def stats():
+    """Disk, memory, load and uptime right now."""
+    import shutil
+    disk = shutil.disk_usage("/")
+    mem = {}
+    try:
+        for line in open("/proc/meminfo"):
+            key, value = line.split(":", 1)
+            mem[key] = int(value.split()[0]) * 1024
+    except OSError:
+        pass
+    try:
+        uptime = float(open("/proc/uptime").read().split()[0])
+    except OSError:
+        uptime = 0
+    load = os.getloadavg() if hasattr(os, "getloadavg") else (0, 0, 0)
+    return {
+        "diskTotal": disk.total, "diskUsed": disk.used,
+        "memTotal": mem.get("MemTotal", 0), "memAvailable": mem.get("MemAvailable", 0),
+        "swapTotal": mem.get("SwapTotal", 0), "swapFree": mem.get("SwapFree", 0),
+        "load": [round(x, 2) for x in load], "uptime": round(uptime),
+    }
+
+
+def cloud_storage_bytes(project):
+    """Bytes in this project's Cloud Storage buckets (the free tier includes 5 GB), using
+    the VM's own service account. None when it can't be read."""
+    try:
+        token = json.loads(metadata("instance/service-accounts/default/token") or "{}").get("access_token")
+        if not token or not project:
+            return None
+
+        def get(url):
+            request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.loads(response.read())
+
+        total = 0
+        api = "https://storage.googleapis.com/storage/v1"
+        for bucket in get(f"{api}/b?project={project}").get("items", []):
+            page = ""
+            while True:
+                listing = get(f"{api}/b/{bucket['name']}/o?fields=items(size),nextPageToken" + page)
+                total += sum(int(o.get("size", 0)) for o in listing.get("items", []))
+                if not listing.get("nextPageToken"):
+                    break
+                page = "&pageToken=" + listing["nextPageToken"]
+        return total
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def poll():
@@ -185,14 +261,21 @@ def poll():
     port: every connection goes out from here."""
     import socket
     host = socket.gethostname()
+    about = machine()
     last_beat = 0
+    storage, storage_at = None, 0
     while True:
         try:
             beat = time.time() - last_beat >= 60
             with _lock:
                 running = sorted(_running)
-            jobs = runner("POST", "/api/svc/claim",
-                          {"heartbeat": beat, "host": host, "running": running})["jobs"]
+            body = {"heartbeat": beat, "host": host, "running": running}
+            if beat:
+                if time.time() - storage_at >= STORAGE_EVERY:
+                    storage, storage_at = cloud_storage_bytes(about["project"]), time.time()
+                body["machine"] = about
+                body["stats"] = stats() | {"cloudStorage": storage}
+            jobs = runner("POST", "/api/svc/claim", body)["jobs"]
             if beat:
                 last_beat = time.time()
             for job in jobs:
