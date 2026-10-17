@@ -45,14 +45,36 @@ if os.environ.get("ASTER_IPV6_ONLY"):
     socket.getaddrinfo = lambda *a, **k: [x for x in _getaddrinfo(*a, **k) if x[0] == socket.AF_INET6] or _getaddrinfo(*a, **k)
 
 
+# One kept-alive connection to the runner per thread. Outbound traffic is what the free
+# tier meters (1 GB a month), and a fresh TLS handshake for every poll cost ten times
+# more than the poll itself.
+_conn = threading.local()
+
+
 def runner(method, path, body=None):
-    request = urllib.request.Request(
-        RUNNER_URL + path, method=method,
-        data=None if body is None else json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json",
-                 "User-Agent": "aster-server/0.1"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read() or b"null")
+    import http.client
+    import urllib.parse
+    host = urllib.parse.urlparse(RUNNER_URL).netloc
+    data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
+    headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json",
+               "User-Agent": "aster-server/0.1"}
+    for attempt in (1, 2):
+        conn = getattr(_conn, "c", None)
+        if conn is None:
+            conn = _conn.c = http.client.HTTPSConnection(host, timeout=30)
+        try:
+            conn.request(method, path, body=data, headers=headers)
+            response = conn.getresponse()
+            payload = response.read()
+        except (http.client.HTTPException, OSError):
+            conn.close()
+            _conn.c = None
+            if attempt == 2:
+                raise
+            continue
+        if response.status >= 400:
+            raise RuntimeError(f"runner {path}: HTTP {response.status} {payload[:200]!r}")
+        return json.loads(payload or b"null")
 
 
 def notebook(workflow):
@@ -177,7 +199,7 @@ class Handler(BaseHTTPRequestHandler):
         print(time.strftime("%H:%M:%S"), fmt % args, flush=True)
 
 
-POLL_SECONDS = 10
+POLL_SECONDS = 30            # how often to ask for queued runs
 STORAGE_EVERY = 600           # seconds between Cloud Storage size checks
 
 METADATA = "http://metadata.google.internal/computeMetadata/v1/"
