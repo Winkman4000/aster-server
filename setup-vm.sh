@@ -30,6 +30,8 @@ Wants=network-online.target
 User=aster
 WorkingDirectory=/opt/aster
 EnvironmentFile=/etc/aster.env
+# The VM has IPv6 only; wait for its route (it arrives a little after boot).
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip -6 route show default | grep -q . && exit 0; sleep 2; done'
 ExecStart=/usr/bin/python3 -u /opt/aster/server.py --poll
 Restart=always
 RestartSec=5

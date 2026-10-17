@@ -37,6 +37,13 @@ KEEP = {"output": 4000, "error": 4000, "value": 8000}
 _running = set()              # workflows with a run in progress
 _lock = threading.Lock()
 
+# IPv6-only server: talk to the runner over IPv6 rather than trying IPv4 first.
+if os.environ.get("ASTER_IPV6_ONLY"):
+    import socket
+
+    _getaddrinfo = socket.getaddrinfo
+    socket.getaddrinfo = lambda *a, **k: [x for x in _getaddrinfo(*a, **k) if x[0] == socket.AF_INET6] or _getaddrinfo(*a, **k)
+
 
 def runner(method, path, body=None):
     request = urllib.request.Request(
@@ -44,7 +51,7 @@ def runner(method, path, body=None):
         data=None if body is None else json.dumps(body).encode(),
         headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json",
                  "User-Agent": "aster-server/0.1"})
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=30) as response:
         return json.loads(response.read() or b"null")
 
 

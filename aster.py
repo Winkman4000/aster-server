@@ -31,17 +31,39 @@ READER_URL = "https://r.jina.ai/"   # for pages that refuse a direct request
 _BLOCKED = {401, 403, 429, 503}
 
 
+# On a server with IPv6 only (ASTER_IPV6_ONLY=1), a site with no IPv6 address should
+# fail at once (and go through aster-runner), not wait out an IPv4 connection that
+# can't succeed.
+if _os.environ.get("ASTER_IPV6_ONLY"):
+    import socket as _socket
+
+    _getaddrinfo = _socket.getaddrinfo
+
+    def _ipv6_only(host, *args, **kwargs):
+        found = _getaddrinfo(host, *args, **kwargs)
+        v6 = [a for a in found if a[0] == _socket.AF_INET6]
+        if found and not v6:
+            raise _socket.gaierror(f"{host} has no IPv6 address")
+        return v6 or found
+
+    _socket.getaddrinfo = _ipv6_only
+
+
 # --- the web -----------------------------------------------------------------------
 
 def fetch(url, *, reader=True, timeout=20):
     """The page or feed at `url` as text. If the site refuses the request, it's fetched
-    once more through a reader service that returns the page's HTML."""
+    once more through a reader service that returns the page's HTML. If it can't be
+    reached at all from here (the server has IPv6 only, and a few sites have no IPv6
+    address), aster-runner fetches it instead."""
     try:
         return _get(url, {"User-Agent": USER_AGENT}, timeout)
     except _urlerror.HTTPError as err:
         if not (reader and err.code in _BLOCKED):
             raise
         return _get(READER_URL + url, {"X-Return-Format": "html"}, timeout + 10)
+    except (_urlerror.URLError, OSError):
+        return _get_via_runner(url, timeout)
 
 
 def fetch_all(fn, things, workers=8):
@@ -223,6 +245,29 @@ def _get(url, headers, timeout):
     with _urlrequest.urlopen(request, timeout=timeout) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         return response.read(3_000_000).decode(charset, errors="replace")
+
+
+def _get_via_runner(url, timeout):
+    base, token = _runner_auth()
+    request = _urlrequest.Request(
+        base + "/api/svc/fetch", data=_json.dumps({"url": url}).encode(), method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                 "User-Agent": USER_AGENT})
+    with _urlrequest.urlopen(request, timeout=timeout + 15) as response:
+        status = int(response.headers.get("X-Upstream-Status", "200"))
+        charset = response.headers.get_content_charset() or "utf-8"
+        text = response.read(3_000_000).decode(charset, errors="replace")
+    if status >= 400:
+        raise RuntimeError(f"{url} returned {status} (fetched through aster-runner)")
+    return text
+
+
+def _runner_auth():
+    url = _os.environ.get("ASTER_RUNNER_URL", "").rstrip("/")
+    token = _os.environ.get("ASTER_RUNNER_TOKEN", "")
+    if not url or not token:
+        raise RuntimeError("not connected to aster-runner (ASTER_RUNNER_URL / ASTER_RUNNER_TOKEN unset)")
+    return url, token
 
 
 def _runner(path, body):
